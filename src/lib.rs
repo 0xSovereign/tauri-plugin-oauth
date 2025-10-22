@@ -26,13 +26,13 @@ const EXIT: [u8; 4] = [1, 3, 3, 7];
 ///
 /// # Panics
 ///
-/// The seperate server thread can panic if its unable to send the html response to the client. This may change after more real world testing.
+/// The separate server thread can panic if its unable to send the response to the client. This may change after more real world testing.
 pub fn start<F: FnMut(String) + Send + 'static>(handler: F) -> Result<u16, std::io::Error> {
     start_with_config(OauthConfig::default(), handler)
 }
 
 /// The optional server config.
-#[derive(Default, serde::Deserialize)]
+#[derive(Default, serde::Deserialize, Clone)]
 pub struct OauthConfig {
     /// An array of hard-coded ports the server should try to bind to.
     /// This should only be used if your oauth provider does not accept wildcard localhost addresses.
@@ -44,6 +44,16 @@ pub struct OauthConfig {
     ///
     /// Default: `"<html><body>Please return to the app.</body></html>"`.
     pub response: Option<Cow<'static, str>>,
+    /// Optional redirect url to use instead of the default text.
+    /// This is useful if you want to use a themed redirect page for your application.
+    ///
+    /// Default: `None`
+    pub redirect_url: Option<String>,
+    /// Optional flag to close the window after the user is redirected.
+    /// This is useful if you don't want the user to have to manually close the window.
+    ///
+    /// Default: `None`
+    pub close_window: Option<bool>,
 }
 
 /// Starts the localhost (using 127.0.0.1) server. Returns the port its listening on.
@@ -52,7 +62,7 @@ pub struct OauthConfig {
 ///
 /// # Arguments
 ///
-/// * `config` - Configuration the server should use, see [`OauthConfig.]
+/// * `config` - Configuration the server should use, see [`OauthConfig`].
 /// * `handler` - Closure which will be executed on a successful connection. It receives the full URL as a String.
 ///
 /// # Errors
@@ -61,13 +71,13 @@ pub struct OauthConfig {
 ///
 /// # Panics
 ///
-/// The seperate server thread can panic if its unable to send the html response to the client. This may change after more real world testing.
+/// The separate server thread can panic if its unable to send the response to the client. This may change after more real world testing.
 pub fn start_with_config<F: FnMut(String) + Send + 'static>(
     config: OauthConfig,
     mut handler: F,
 ) -> Result<u16, std::io::Error> {
     let listener = match config.ports {
-        Some(ports) => TcpListener::bind(
+        Some(ref ports) => TcpListener::bind(
             ports
                 .iter()
                 .map(|p| SocketAddr::from(([127, 0, 0, 1], *p)))
@@ -79,11 +89,18 @@ pub fn start_with_config<F: FnMut(String) + Send + 'static>(
 
     let port = listener.local_addr()?.port();
 
+    let config_clone = config.clone();
     thread::spawn(move || {
         for conn in listener.incoming() {
             match conn {
                 Ok(conn) => {
-                    if let Some(url) = handle_connection(conn, config.response.as_deref(), port) {
+                    if let Some(url) = handle_connection(
+                        conn,
+                        config_clone.response.as_deref(),
+                        port,
+                        config_clone.redirect_url.as_deref(),
+                        config_clone.close_window.unwrap_or(false),
+                    ) {
                         // Using an empty string to communicate that a shutdown was requested.
                         if !url.is_empty() {
                             handler(url);
@@ -102,7 +119,13 @@ pub fn start_with_config<F: FnMut(String) + Send + 'static>(
     Ok(port)
 }
 
-fn handle_connection(mut conn: TcpStream, response: Option<&str>, port: u16) -> Option<String> {
+fn handle_connection(
+    mut conn: TcpStream,
+    response: Option<&str>,
+    port: u16,
+    redirect_url: Option<&str>,
+    close_window: bool,
+) -> Option<String> {
     let mut buffer = [0; 4048];
     if let Err(io_err) = conn.read(&mut buffer) {
         log::error!("Error reading incoming connection: {}", io_err.to_string());
@@ -125,7 +148,18 @@ fn handle_connection(mut conn: TcpStream, response: Option<&str>, port: u16) -> 
 
     for header in &headers {
         if header.name == "Full-Url" {
-            return Some(String::from_utf8_lossy(header.value).to_string());
+            let full_url = String::from_utf8_lossy(header.value).to_string();
+            // If redirect_url was provided, just send a 302 redirect
+            if let Some(redirect) = redirect_url {
+                let response = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: {}\r\nContent-Length: 0\r\n\r\n",
+                    redirect
+                );
+                conn.write_all(response.as_bytes()).unwrap();
+                conn.flush().unwrap();
+                return Some(full_url);
+            }
+            return Some(full_url);
         } else if header.name == "Host" {
             is_localhost = String::from_utf8_lossy(header.value).starts_with("localhost");
         }
@@ -136,16 +170,24 @@ fn handle_connection(mut conn: TcpStream, response: Option<&str>, port: u16) -> 
         );
     }
 
+    // Add window.close() script if close_window ends up as true
+    let close_script = if close_window {
+        "<script>window.close();</script>"
+    } else {
+        ""
+    };
+
     let script = format!(
-        r#"<script>fetch("http://{}:{}/cb",{{headers:{{"Full-Url":window.location.href}}}})</script>"#,
+        r#"<script>fetch("http://{}:{}/cb",{{headers:{{"Full-Url":window.location.href}}}})</script>{}"#,
         if is_localhost {
             "localhost"
         } else {
             "127.0.0.1"
         },
-        port
+        port,
+        close_script
     );
-    let response = match response {
+    let response_body = match response {
         Some(s) if s.contains("<head>") => s.replace("<head>", &format!("<head>{}", script)),
         Some(s) if s.contains("<body>") => {
             s.replace("<body>", &format!("<head>{}</head><body>", script))
@@ -162,12 +204,12 @@ fn handle_connection(mut conn: TcpStream, response: Option<&str>, port: u16) -> 
         ),
     };
 
-    // TODO: Test if unwrapping here is safe (enough).
+    // Send HTML response if no redirect_url is provided
     conn.write_all(
         format!(
             "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
-            response.len(),
-            response
+            response_body.len(),
+            response_body
         )
         .as_bytes(),
     )
@@ -184,8 +226,6 @@ fn handle_connection(mut conn: TcpStream, response: Option<&str>, port: u16) -> 
 ///
 /// - Returns `std::io::Error` if the server couldn't be reached.
 pub fn cancel(port: u16) -> Result<(), std::io::Error> {
-    // Using tcp instead of something global-ish like an AtomicBool,
-    // so we don't have to dive into the set_nonblocking madness.
     let mut stream = TcpStream::connect(SocketAddr::from(([127, 0, 0, 1], port)))?;
     stream.write_all(&EXIT)?;
     stream.flush()?;

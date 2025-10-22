@@ -1,5 +1,5 @@
-import { invoke } from '@tauri-apps/api/core';
-import { Event, listen } from '@tauri-apps/api/event';
+import { invoke } from "@tauri-apps/api/core";
+import { Event, listen } from "@tauri-apps/api/event";
 
 /**
  * Configuration options for the OAuth server.
@@ -16,6 +16,18 @@ export interface OauthConfig {
    * If not provided, a default response will be used.
    */
   response?: string;
+
+  /**
+   * Optional redirect URL to use instead of the default text.
+   * This is useful if you want to use a themed redirect page for your application.
+   */
+  redirect_url?: string;
+
+  /**
+   * Optional flag to close the window after the user is redirected.
+   * This is useful if you don't want the user to have to manually close the window.
+   */
+  close_window?: boolean;
 }
 
 /**
@@ -31,7 +43,7 @@ export interface OauthConfig {
  * ```
  */
 export async function start(config?: OauthConfig): Promise<number> {
-  return await invoke<number>('plugin:oauth|start', { config });
+  return await invoke<number>("plugin:oauth|start", { config });
 }
 
 /**
@@ -47,7 +59,7 @@ export async function start(config?: OauthConfig): Promise<number> {
  * ```
  */
 export async function cancel(port: number): Promise<void> {
-  await invoke<void>('plugin:oauth|cancel', { port });
+  await invoke<void>("plugin:oauth|cancel", { port });
 }
 
 /**
@@ -68,7 +80,7 @@ export async function cancel(port: number): Promise<void> {
  * ```
  */
 export function onUrl(callback: (url: string) => void): Promise<() => void> {
-  return listen('oauth://url', (event: Event<string>) => {
+  return listen("oauth://url", (event: Event<string>) => {
     callback(event.payload);
   });
 }
@@ -90,8 +102,10 @@ export function onUrl(callback: (url: string) => void): Promise<() => void> {
  * unlisten();
  * ```
  */
-export function onInvalidUrl(callback: (error: string) => void): Promise<() => void> {
-  return listen('oauth://invalid-url', (event: Event<string>) => {
+export function onInvalidUrl(
+  callback: (error: string) => void,
+): Promise<() => void> {
+  return listen("oauth://invalid-url", (event: Event<string>) => {
     callback(event.payload);
   });
 }
